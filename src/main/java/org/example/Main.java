@@ -11,6 +11,8 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 
 public class Main {
 
@@ -18,6 +20,62 @@ public class Main {
     private static final double MIN_HIT_GAP_SECONDS = 0.5;
 
     private static final String FFMPEG_ENV = "FFMPEG_PATH";
+    private static final String DEFAULT_SCREENSHOT_HEADING = "Test Case 1";
+    private static final String DEFAULT_USER_STORY_HEADING = "General / No User Story Mentioned";
+
+    // Detects: Test Case 1, Testcase 1, TC 1, TC1, Test Case Number 1
+    private static final Pattern TEST_CASE_DIGIT_PATTERN = Pattern.compile(
+            "\\b(?:test\\s*case|testcase|tc)\\s*(?:number\\s*)?(\\d+)\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    // Detects: Test Case One, Testcase One, TC One
+    private static final Pattern TEST_CASE_WORD_AFTER_PATTERN = Pattern.compile(
+            "\\b(?:test\\s*case|testcase|tc)\\s*(?:number\\s*)?(" + numberWordAlternatives() + ")\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    // Detects: First Test Case, Second Testcase, Third TC
+    private static final Pattern TEST_CASE_WORD_BEFORE_PATTERN = Pattern.compile(
+            "\\b(" + numberWordAlternatives() + ")\\s+(?:test\\s*case|testcase|tc)\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    // Detects: Scenario 1, Scenario One
+    private static final Pattern SCENARIO_DIGIT_PATTERN = Pattern.compile(
+            "\\bscenario\\s*(\\d+)\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    private static final Pattern SCENARIO_WORD_PATTERN = Pattern.compile(
+            "\\bscenario\\s*(" + numberWordAlternatives() + ")\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    // Detects:
+    // User Story 456789
+    // Story 456789
+    // Story Number 456789
+    // Story number is 456789
+    // US 456789
+    // ADO Story 456789
+    private static final Pattern USER_STORY_PATTERN = Pattern.compile(
+            "\\b(?:user\\s*story|userstory|ado\\s*story|story|us)" +
+                    "\\s*(?:number|no|id)?\\s*(?:is)?\\s*#?\\s*(\\d{4,})\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    // Detects: Bug, Bug 12345, Defect, Defect 12345, Issue, Issue 12345
+    private static final Pattern BUG_PATTERN = Pattern.compile(
+            "\\b(?:bug|defect|issue)\\s*#?\\s*(\\d+)?\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    // Detects: next test case, next testcase, next test, moving to next test, go to next test
+    private static final Pattern NEXT_TEST_CASE_PATTERN = Pattern.compile(
+            "\\b(?:next|moving\\s+to\\s+next|go\\s+to\\s+next|start\\s+next|another)\\s+(?:test\\s*case|testcase|test|tc)\\b",
+            Pattern.CASE_INSENSITIVE
+    );
 
     private static final List<String> SCREENSHOT_TRIGGERS = List.of(
             "screenshot",
@@ -126,27 +184,21 @@ public class Main {
             ProcessingResult result = processTranscript(videoFile, transcriptFile, outputDocx, tempDir);
 
             try (XWPFDocument document = new XWPFDocument()) {
-                addTitle(document, "Teams Recording Screenshots");
-
-                addSummary(document, result);
+                addQAEvidenceTitle(document);
 
                 if (result.hits().isEmpty()) {
                     addParagraph(document, "No screenshot triggers found in the Teams transcript.");
                 } else {
-                    for (int index = 0; index < result.hits().size(); index++) {
-                        TranscriptHit hit = result.hits().get(index);
-                        addScreenshotEntry(document, index + 1, hit, hit.imagePath());
-                    }
+                    addTableOfContents(document, result.hits());
+                    addPageBreak(document);
+                    addGroupedScreenshotEntries(document, result);
                 }
 
-                addTranscriptReportSection(document, result.entries());
-
+                //Saved Word document to     outputDocx
                 try (OutputStream outputStream = Files.newOutputStream(outputDocx)) {
                     document.write(outputStream);
                 }
             }
-
-            System.out.println("Saved Word document to: " + outputDocx);
 
         } finally {
             deleteRecursively(tempDir);
@@ -162,18 +214,43 @@ public class Main {
 
         List<TranscriptEntry> entries = readTeamsTranscript(transcriptFile, outputDocx);
         List<TranscriptHit> hits = new ArrayList<>();
-
-        System.out.println("Total transcript entries found: " + entries.size());
+        List<SectionTranscriptLine> sectionTranscriptLines = new ArrayList<>();
+        String currentUserStoryHeading = DEFAULT_USER_STORY_HEADING;
+        int currentTestCaseNumber = 1;
+        String currentTestCaseHeading = DEFAULT_SCREENSHOT_HEADING;
 
         for (TranscriptEntry entry : entries) {
+            Optional<String> userStoryHeading = findUserStoryHeading(entry.text());
+
+            if (userStoryHeading.isPresent()) {
+                currentUserStoryHeading = userStoryHeading.get();
+                currentTestCaseNumber = 1;
+                currentTestCaseHeading = DEFAULT_SCREENSHOT_HEADING;
+            }
+
+            Optional<TestCaseMarker> testCaseMarker = findTestCaseMarker(entry.text(), currentTestCaseNumber);
+
+            if (testCaseMarker.isPresent()) {
+                currentTestCaseNumber = testCaseMarker.get().number();
+                currentTestCaseHeading = testCaseMarker.get().heading();
+            }
+
+            Optional<String> bugHeading = findBugHeading(entry.text());
+
+            if (bugHeading.isPresent()) {
+                currentTestCaseHeading = bugHeading.get();
+            }
+
+            sectionTranscriptLines.add(new SectionTranscriptLine(
+                    currentUserStoryHeading,
+                    currentTestCaseHeading,
+                    entry.seconds(),
+                    entry.speaker(),
+                    entry.text()
+            ));
+
             MatchResult matchResult = findMatchedTrigger(entry.text());
 
-            System.out.println("Time      : " + formatSeconds(entry.seconds()));
-            System.out.println("Speaker   : " + entry.speaker());
-            System.out.println("Text      : " + entry.text());
-            System.out.println("Normalized: " + normalizeTriggerText(entry.text()));
-            System.out.println("Match     : " + (matchResult.matched() ? "YES - " + matchResult.trigger() : "NO"));
-            System.out.println("--------------------------------------------------");
 
             if (matchResult.matched()) {
                 double captureSeconds = Math.max(0, entry.seconds() + CAPTURE_OFFSET_SECONDS);
@@ -191,13 +268,15 @@ public class Main {
                             entry.speaker(),
                             entry.text(),
                             matchResult.trigger(),
+                            currentUserStoryHeading,
+                            currentTestCaseHeading,
                             screenshotPath
                     ));
                 }
             }
         }
 
-        return new ProcessingResult(hits, entries);
+        return new ProcessingResult(hits, entries, sectionTranscriptLines);
     }
 
     private static List<TranscriptEntry> readTeamsTranscript(Path transcriptFile, Path outputDocx) throws IOException {
@@ -212,10 +291,9 @@ public class Main {
         }
 
         content = removeBom(content);
-
+        //Extracted transcript text saved to debug file
         Path debugFile = createDebugTranscriptPath(outputDocx);
-        Files.writeString(debugFile, content, StandardCharsets.UTF_8);
-        System.out.println("Extracted transcript text saved to: " + debugFile);
+        // Files.writeString(debugFile, content, StandardCharsets.UTF_8);
 
         if (isVttTranscript(content, transcriptFile)) {
             return readVttTranscript(content);
@@ -511,6 +589,166 @@ public class Main {
         return new MatchResult(false, "NO MATCH");
     }
 
+    static boolean containsScreenshot(String text) {
+        return findMatchedTrigger(text).matched();
+    }
+
+    static Optional<String> detectTestCaseHeading(String text, int currentTestCaseNumber) {
+        return findTestCaseMarker(text, currentTestCaseNumber).map(TestCaseMarker::heading);
+    }
+
+    private static Optional<TestCaseMarker> findTestCaseMarker(String text, int currentTestCaseNumber) {
+        String normalized = normalizeTriggerText(text);
+
+        if (normalized.isBlank()) {
+            return Optional.empty();
+        }
+
+        Optional<TestCaseMarker> scenarioMarker = findScenarioMarker(normalized);
+
+        if (scenarioMarker.isPresent()) {
+            return scenarioMarker;
+        }
+
+        OptionalInt explicitNumber = findExplicitTestCaseNumber(normalized);
+
+        if (explicitNumber.isPresent()) {
+            int number = explicitNumber.getAsInt();
+            return Optional.of(new TestCaseMarker(number, "Test Case " + number));
+        }
+
+        if (NEXT_TEST_CASE_PATTERN.matcher(normalized).find()) {
+            int nextNumber = Math.max(1, currentTestCaseNumber + 1);
+            return Optional.of(new TestCaseMarker(nextNumber, "Test Case " + nextNumber));
+        }
+
+        return Optional.empty();
+    }
+
+    private static Optional<String> findUserStoryHeading(String text) {
+        String normalizedText = normalizeTriggerText(text);
+
+        if (normalizedText.isBlank()) {
+            return Optional.empty();
+        }
+
+        Matcher userStoryMatcher = USER_STORY_PATTERN.matcher(normalizedText);
+
+        if (userStoryMatcher.find()) {
+            return Optional.of("User Story " + userStoryMatcher.group(1));
+        }
+
+        return Optional.empty();
+    }
+
+    private static Optional<String> findBugHeading(String text) {
+        String normalizedText = normalizeTriggerText(text);
+
+        if (normalizedText.isBlank()) {
+            return Optional.empty();
+        }
+
+        Matcher bugMatcher = BUG_PATTERN.matcher(normalizedText);
+
+        if (bugMatcher.find()) {
+            String phrase = bugMatcher.group(0).trim();
+            String number = bugMatcher.group(1);
+
+            if (phrase.startsWith("defect")) {
+                return Optional.of(number == null || number.isBlank() ? "Defect" : "Defect " + number);
+            }
+
+            if (phrase.startsWith("issue")) {
+                return Optional.of(number == null || number.isBlank() ? "Issue" : "Issue " + number);
+            }
+
+            return Optional.of(number == null || number.isBlank() ? "Bug" : "Bug " + number);
+        }
+
+        return Optional.empty();
+    }
+
+    private static Optional<TestCaseMarker> findScenarioMarker(String normalizedText) {
+        Matcher scenarioDigitMatcher = SCENARIO_DIGIT_PATTERN.matcher(normalizedText);
+
+        if (scenarioDigitMatcher.find()) {
+            int number = Integer.parseInt(scenarioDigitMatcher.group(1));
+            return Optional.of(new TestCaseMarker(number, "Scenario " + number));
+        }
+
+        Matcher scenarioWordMatcher = SCENARIO_WORD_PATTERN.matcher(normalizedText);
+
+        if (scenarioWordMatcher.find()) {
+            OptionalInt number = parseNumberWord(scenarioWordMatcher.group(1));
+
+            if (number.isPresent()) {
+                return Optional.of(new TestCaseMarker(number.getAsInt(), "Scenario " + number.getAsInt()));
+            }
+        }
+
+        return Optional.empty();
+    }
+
+    private static OptionalInt findExplicitTestCaseNumber(String normalizedText) {
+        Matcher digitMatcher = TEST_CASE_DIGIT_PATTERN.matcher(normalizedText);
+
+        if (digitMatcher.find()) {
+            return OptionalInt.of(Integer.parseInt(digitMatcher.group(1)));
+        }
+
+        Matcher wordAfterMatcher = TEST_CASE_WORD_AFTER_PATTERN.matcher(normalizedText);
+
+        if (wordAfterMatcher.find()) {
+            return parseNumberWord(wordAfterMatcher.group(1));
+        }
+
+        Matcher wordBeforeMatcher = TEST_CASE_WORD_BEFORE_PATTERN.matcher(normalizedText);
+
+        if (wordBeforeMatcher.find()) {
+            return parseNumberWord(wordBeforeMatcher.group(1));
+        }
+
+        return OptionalInt.empty();
+    }
+
+    private static OptionalInt parseNumberWord(String value) {
+        if (value == null) {
+            return OptionalInt.empty();
+        }
+
+        return switch (value.toLowerCase(Locale.ROOT)) {
+            case "one", "first" -> OptionalInt.of(1);
+            case "two", "second" -> OptionalInt.of(2);
+            case "three", "third" -> OptionalInt.of(3);
+            case "four", "fourth" -> OptionalInt.of(4);
+            case "five", "fifth" -> OptionalInt.of(5);
+            case "six", "sixth" -> OptionalInt.of(6);
+            case "seven", "seventh" -> OptionalInt.of(7);
+            case "eight", "eighth" -> OptionalInt.of(8);
+            case "nine", "ninth" -> OptionalInt.of(9);
+            case "ten", "tenth" -> OptionalInt.of(10);
+            case "eleven", "eleventh" -> OptionalInt.of(11);
+            case "twelve", "twelfth" -> OptionalInt.of(12);
+            case "thirteen", "thirteenth" -> OptionalInt.of(13);
+            case "fourteen", "fourteenth" -> OptionalInt.of(14);
+            case "fifteen", "fifteenth" -> OptionalInt.of(15);
+            case "sixteen", "sixteenth" -> OptionalInt.of(16);
+            case "seventeen", "seventeenth" -> OptionalInt.of(17);
+            case "eighteen", "eighteenth" -> OptionalInt.of(18);
+            case "nineteen", "nineteenth" -> OptionalInt.of(19);
+            case "twenty", "twentieth" -> OptionalInt.of(20);
+            default -> OptionalInt.empty();
+        };
+    }
+
+    private static String numberWordAlternatives() {
+        return "one|first|two|second|three|third|four|fourth|five|fifth|six|sixth|seven|seventh|"
+                + "eight|eighth|nine|ninth|ten|tenth|eleven|eleventh|twelve|twelfth|"
+                + "thirteen|thirteenth|fourteen|fourteenth|fifteen|fifteenth|"
+                + "sixteen|sixteenth|seventeen|seventeenth|eighteen|eighteenth|"
+                + "nineteen|nineteenth|twenty|twentieth";
+    }
+
     private static String normalizeTriggerText(String text) {
         if (text == null) {
             return "";
@@ -587,12 +825,12 @@ public class Main {
         run.setText(title);
     }
 
-    private static void addSummary(XWPFDocument document, ProcessingResult result) {
+    /*private static void addSummary(XWPFDocument document, ProcessingResult result) {
         addParagraph(document, "Total transcript entries found: " + result.entries().size());
         addParagraph(document, "Total screenshots captured: " + result.hits().size());
         addParagraph(document, "Capture offset seconds: " + CAPTURE_OFFSET_SECONDS);
         addParagraph(document, "Minimum hit gap seconds: " + MIN_HIT_GAP_SECONDS);
-    }
+    }*/
 
     private static void addParagraph(XWPFDocument document, String text) {
         XWPFParagraph paragraph = document.createParagraph();
@@ -613,13 +851,13 @@ public class Main {
 
         headingRun.setBold(true);
         headingRun.setFontSize(12);
-        headingRun.setText("Screenshot " + index);
+        headingRun.setText("Screenshot " + index + " (" + formatSeconds(hit.captureSeconds()) + ")");
 
-        addParagraph(document, "Transcript Time: " + formatSeconds(hit.transcriptSeconds()));
-        addParagraph(document, "Captured Video Time: " + formatSeconds(hit.captureSeconds()));
-        addParagraph(document, "Speaker: " + hit.speaker());
-        addParagraph(document, "Matched Trigger: " + hit.matchedTrigger());
-        addParagraph(document, "Transcript Text: " + hit.text());
+//        addParagraph(document, "Transcript Time: " + formatSeconds(hit.transcriptSeconds()));
+//        addParagraph(document, "Captured Video Time: " + formatSeconds(hit.captureSeconds()));
+//        addParagraph(document, "Speaker: " + hit.speaker());
+//        addParagraph(document, "Matched Trigger: " + hit.matchedTrigger());
+//        addParagraph(document, "Transcript Text: " + hit.text());
 
         XWPFParagraph imageParagraph = document.createParagraph();
         XWPFRun imageRun = imageParagraph.createRun();
@@ -633,6 +871,316 @@ public class Main {
                     Units.toEMU(292)
             );
         }
+    }
+
+    private static void addGroupedScreenshotEntries(
+            XWPFDocument document,
+            ProcessingResult result
+    ) throws IOException, InvalidFormatException {
+
+        List<TranscriptHit> hits = result.hits();
+        String previousUserStory = null;
+        String previousSection = null;
+
+        for (int index = 0; index < hits.size(); index++) {
+            TranscriptHit hit = hits.get(index);
+
+            String userStoryHeading = safeHeading(hit.userStoryHeading(), DEFAULT_USER_STORY_HEADING);
+            String sectionHeading = safeHeading(hit.testCaseHeading(), DEFAULT_SCREENSHOT_HEADING);
+
+            if (!userStoryHeading.equals(previousUserStory)) {
+                if (previousUserStory != null) {
+                    addMajorDivider(document);
+                }
+
+                addUserStoryHeading(document, userStoryHeading);
+                previousUserStory = userStoryHeading;
+                previousSection = null;
+            }
+
+            if (!sectionHeading.equals(previousSection)) {
+                if (previousSection != null) {
+                    addMinorDivider(document);
+                }
+
+                addTestCaseHeading(document, sectionHeading);
+                previousSection = sectionHeading;
+            }
+
+            addScreenshotEntry(document, index + 1, hit, hit.imagePath());
+        }
+    }
+
+    private static void addQAEvidenceTitle(XWPFDocument document) {
+        XWPFParagraph title = document.createParagraph();
+        XWPFRun titleRun = title.createRun();
+        titleRun.setBold(true);
+        titleRun.setFontSize(20);
+        titleRun.setText("QA Evidence");
+
+        XWPFParagraph generated = document.createParagraph();
+        XWPFRun generatedRun = generated.createRun();
+        generatedRun.setFontSize(10);
+        generatedRun.setText("Generated On: " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("MM/dd/yyyy hh:mm a")));
+    }
+
+    private static void addTableOfContents(XWPFDocument document, List<TranscriptHit> hits) {
+        addMajorDivider(document);
+
+        XWPFParagraph heading = document.createParagraph();
+        XWPFRun headingRun = heading.createRun();
+        headingRun.setBold(true);
+        headingRun.setFontSize(14);
+        headingRun.setText("TABLE OF CONTENTS");
+
+        Map<String, LinkedHashMap<String, Integer>> counts = buildTableOfContentsCounts(hits);
+
+        for (Map.Entry<String, LinkedHashMap<String, Integer>> storyEntry : counts.entrySet()) {
+            XWPFParagraph storyParagraph = document.createParagraph();
+            XWPFRun storyRun = storyParagraph.createRun();
+            storyRun.setBold(true);
+            storyRun.setFontSize(12);
+            storyRun.setText(storyEntry.getKey());
+
+            for (Map.Entry<String, Integer> sectionEntry : storyEntry.getValue().entrySet()) {
+                XWPFParagraph sectionParagraph = document.createParagraph();
+                sectionParagraph.setIndentationLeft(360);
+                XWPFRun sectionRun = sectionParagraph.createRun();
+                sectionRun.setFontSize(11);
+                sectionRun.setText("• " + sectionEntry.getKey() + " (" + sectionEntry.getValue() + " " + pluralizeScreenshot(sectionEntry.getValue()) + ")");
+            }
+        }
+
+        addMajorDivider(document);
+    }
+
+    private static Map<String, LinkedHashMap<String, Integer>> buildTableOfContentsCounts(List<TranscriptHit> hits) {
+        Map<String, LinkedHashMap<String, Integer>> counts = new LinkedHashMap<>();
+
+        for (TranscriptHit hit : hits) {
+            String userStory = safeHeading(hit.userStoryHeading(), DEFAULT_USER_STORY_HEADING);
+            String section = safeHeading(hit.testCaseHeading(), DEFAULT_SCREENSHOT_HEADING);
+
+            counts.computeIfAbsent(userStory, key -> new LinkedHashMap<>())
+                    .merge(section, 1, Integer::sum);
+        }
+
+        return counts;
+    }
+
+    private static String pluralizeScreenshot(int count) {
+        return count == 1 ? "screenshot" : "screenshots";
+    }
+
+    private static void addPageBreak(XWPFDocument document) {
+        XWPFParagraph paragraph = document.createParagraph();
+        paragraph.setPageBreak(true);
+    }
+
+    private static void addMajorDivider(XWPFDocument document) {
+        addParagraph(document, "=========================================================");
+    }
+
+    private static void addMinorDivider(XWPFDocument document) {
+        addParagraph(document, "---------------------------------------------------------");
+    }
+
+    private static String safeHeading(String value, String defaultValue) {
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+
+        return value;
+    }
+
+    private static Map<String, List<SectionTranscriptLine>> groupLinesByUserStory(List<SectionTranscriptLine> lines) {
+        Map<String, List<SectionTranscriptLine>> grouped = new LinkedHashMap<>();
+
+        for (SectionTranscriptLine line : lines) {
+            String userStory = safeHeading(line.userStoryHeading(), DEFAULT_USER_STORY_HEADING);
+            grouped.computeIfAbsent(userStory, key -> new ArrayList<>()).add(line);
+        }
+
+        return grouped;
+    }
+
+    private static Map<String, List<SectionTranscriptLine>> groupLinesByUserStoryAndTestCase(List<SectionTranscriptLine> lines) {
+        Map<String, List<SectionTranscriptLine>> grouped = new LinkedHashMap<>();
+
+        for (SectionTranscriptLine line : lines) {
+            String userStory = safeHeading(line.userStoryHeading(), DEFAULT_USER_STORY_HEADING);
+            String testCase = safeHeading(line.testCaseHeading(), DEFAULT_SCREENSHOT_HEADING);
+            grouped.computeIfAbsent(sectionKey(userStory, testCase), key -> new ArrayList<>()).add(line);
+        }
+
+        return grouped;
+    }
+
+    private static String sectionKey(String userStoryHeading, String testCaseHeading) {
+        return userStoryHeading + " || " + testCaseHeading;
+    }
+
+    private static void addSummaryBlock(XWPFDocument document, String title, SummaryInfo summaryInfo) {
+        XWPFParagraph titleParagraph = document.createParagraph();
+        XWPFRun titleRun = titleParagraph.createRun();
+        titleRun.setBold(true);
+        titleRun.setFontSize(11);
+        titleRun.setText(title);
+
+        addParagraph(document, "Status: " + summaryInfo.status());
+
+        if (summaryInfo.summaryLines().isEmpty()) {
+            addParagraph(document, "Summary: No clear discussion summary was detected from the transcript for this section.");
+        } else {
+            addParagraph(document, "Summary:");
+
+            for (String line : summaryInfo.summaryLines()) {
+                addParagraph(document, "• " + line);
+            }
+        }
+    }
+
+    private static SummaryInfo summarizeLines(List<SectionTranscriptLine> lines) {
+        if (lines == null || lines.isEmpty()) {
+            return new SummaryInfo("Not Determined", List.of());
+        }
+
+        List<String> cleanedLines = new ArrayList<>();
+
+        for (SectionTranscriptLine line : lines) {
+            String cleaned = cleanTranscriptLineForSummary(line.text());
+
+            if (!cleaned.isBlank()) {
+                cleanedLines.add(cleaned);
+            }
+        }
+
+        String combined = String.join(". ", cleanedLines)
+                .replaceAll("\\s+", " ")
+                .trim();
+
+        String status = inferStatus(combined);
+        List<String> summaryLines = extractSummaryLines(cleanedLines);
+
+        return new SummaryInfo(status, summaryLines);
+    }
+
+    private static String cleanTranscriptLineForSummary(String text) {
+        if (text == null) {
+            return "";
+        }
+
+        String cleaned = removeVttTags(text)
+                .replaceAll("(?i)\\b(user\\s*story|us)\\s*#?\\s*\\d{4,}\\b", " ")
+                .replaceAll("(?i)\\b(?:test\\s*case|testcase|tc)\\s*(?:number\\s*)?\\d+\\b", " ")
+                .replaceAll("(?i)\\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\\s+(?:test\\s*case|testcase|tc)\\b", " ")
+                .replaceAll("(?i)\\bnext\\s+(?:test\\s*case|testcase|test|tc)\\b", " ")
+                .replaceAll("(?i)\\bscreen\\s*shot[s]?\\b|\\bscreenshot[s]?\\b", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+
+        if (cleaned.length() < 4) {
+            return "";
+        }
+
+        return cleaned;
+    }
+
+    private static String inferStatus(String combinedText) {
+        String normalized = normalizeTriggerText(combinedText);
+
+        if (normalized.isBlank()) {
+            return "Not Determined";
+        }
+
+        if (containsAny(normalized,
+                "blocked", "unable", "cannot", "can not", "access issue", "permission issue")) {
+            return "Blocked / Needs Assistance";
+        }
+
+        if (containsAny(normalized,
+                "not working", "failed", "failure", "error", "issue", "defect", "bug", "incorrect", "mismatch", "did not", "doesn t", "does not")) {
+            return "Needs Review";
+        }
+
+        if (containsAny(normalized,
+                "pass", "passed", "looks good", "working", "works", "verified", "validated", "correct", "expected", "success", "successful")) {
+            return "Pass / Verified";
+        }
+
+        return "Not Determined";
+    }
+
+    private static boolean containsAny(String normalizedText, String... phrases) {
+        for (String phrase : phrases) {
+            if (normalizedText.contains(normalizeTriggerText(phrase))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static List<String> extractSummaryLines(List<String> cleanedLines) {
+        List<String> selected = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+
+        for (String line : cleanedLines) {
+            String normalized = normalizeTriggerText(line);
+
+            if (normalized.isBlank() || seen.contains(normalized)) {
+                continue;
+            }
+
+            if (isUsefulSummaryLine(normalized) || selected.size() < 2) {
+                selected.add(shortenForSummary(line));
+                seen.add(normalized);
+            }
+
+            if (selected.size() >= 4) {
+                break;
+            }
+        }
+
+        if (selected.isEmpty() && !cleanedLines.isEmpty()) {
+            selected.add(shortenForSummary(cleanedLines.get(0)));
+        }
+
+        return selected;
+    }
+
+    private static boolean isUsefulSummaryLine(String normalizedText) {
+        return containsAny(normalizedText,
+                "validate", "verified", "confirm", "expected", "actual", "working", "not working", "error", "issue", "defect",
+                "application", "salesforce", "banner", "submit", "status", "field", "document", "signature", "pdf", "test");
+    }
+
+    private static String shortenForSummary(String line) {
+        String cleaned = line.replaceAll("\\s+", " ").trim();
+
+        if (cleaned.length() <= 220) {
+            return cleaned;
+        }
+
+        return cleaned.substring(0, 217).trim() + "...";
+    }
+
+    private static void addUserStoryHeading(XWPFDocument document, String headingText) {
+        XWPFParagraph heading = document.createParagraph();
+        XWPFRun headingRun = heading.createRun();
+
+        headingRun.setBold(true);
+        headingRun.setFontSize(18);
+        headingRun.setText(headingText);
+    }
+
+    private static void addTestCaseHeading(XWPFDocument document, String headingText) {
+        XWPFParagraph heading = document.createParagraph();
+        XWPFRun headingRun = heading.createRun();
+
+        headingRun.setBold(true);
+        headingRun.setFontSize(14);
+        headingRun.setText(headingText);
     }
 
     private static void addTranscriptReportSection(
@@ -649,21 +1197,11 @@ public class Main {
         headingRun.setFontSize(16);
         headingRun.setText("Readable Teams Transcript Used for Screenshot Detection");
 
-        addParagraph(document, "This section shows each transcript entry, normalized text, and whether it matched a screenshot trigger.");
 
         for (TranscriptEntry entry : entries) {
             MatchResult matchResult = findMatchedTrigger(entry.text());
 
             addTranscriptSeparator(document);
-            addTranscriptLine(document, "Time: " + formatSeconds(entry.seconds()));
-            addTranscriptLine(document, "Speaker: " + entry.speaker());
-            addTranscriptLine(document, "Original Transcript Text: " + entry.text());
-            addTranscriptLine(document, "Normalized Text: " + normalizeTriggerText(entry.text()));
-            addTranscriptLine(document, "Matched Trigger: " + (
-                    matchResult.matched()
-                            ? "YES - " + matchResult.trigger()
-                            : "NO"
-            ));
         }
     }
 
@@ -674,17 +1212,7 @@ public class Main {
         XWPFRun run = paragraph.createRun();
         run.setFontFamily("Courier New");
         run.setFontSize(9);
-        run.setText("============================================================");
-    }
 
-    private static void addTranscriptLine(XWPFDocument document, String text) {
-        XWPFParagraph paragraph = document.createParagraph();
-        paragraph.setSpacingAfter(0);
-
-        XWPFRun run = paragraph.createRun();
-        run.setFontFamily("Courier New");
-        run.setFontSize(9);
-        run.setText(text == null ? "" : text);
     }
 
     static String formatSeconds(double seconds) {
@@ -783,7 +1311,8 @@ public class Main {
 
     private record ProcessingResult(
             List<TranscriptHit> hits,
-            List<TranscriptEntry> entries
+            List<TranscriptEntry> entries,
+            List<SectionTranscriptLine> sectionTranscriptLines
     ) {}
 
     private record TranscriptEntry(
@@ -792,12 +1321,27 @@ public class Main {
             String text
     ) {}
 
+
+    private record SectionTranscriptLine(
+            String userStoryHeading,
+            String testCaseHeading,
+            double transcriptSeconds,
+            String speaker,
+            String text
+    ) {}
+
+    private record SummaryInfo(
+            String status,
+            List<String> summaryLines
+    ) {}
     private record TranscriptHit(
             double transcriptSeconds,
             double captureSeconds,
             String speaker,
             String text,
             String matchedTrigger,
+            String userStoryHeading,
+            String testCaseHeading,
             Path imagePath
     ) {}
 
@@ -811,4 +1355,6 @@ public class Main {
             String speaker,
             String textBeforeTimestamp
     ) {}
+
+    private record TestCaseMarker(int number, String heading) { }
 }
