@@ -778,10 +778,10 @@ public class Main {
         Process process = new ProcessBuilder(
                 resolveExecutable(FFMPEG_ENV, "ffmpeg"),
                 "-y",
-                "-i",
-                videoFile.toString(),
                 "-ss",
                 String.format(Locale.ROOT, "%.3f", seconds),
+                "-i",
+                videoFile.toString(),
                 "-frames:v",
                 "1",
                 "-q:v",
